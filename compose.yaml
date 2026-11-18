@@ -1,0 +1,49 @@
+name: cdc-slot-reaper
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: appdb
+      # 仅用于本地演示: 免密 trust, 方便在 db 容器内用 pg_recvlogical 模拟消费者。
+      # 生产环境务必去掉此项并使用强认证。
+      POSTGRES_HOST_AUTH_METHOD: trust
+    # 逻辑复制槽需要 wal_level=logical
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_wal_senders=10
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d appdb"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  app:
+    build: ./app
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGDATABASE: appdb
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      SLOT_NAME: cdc_demo_slot
+      LEASE_SECONDS: "5"
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

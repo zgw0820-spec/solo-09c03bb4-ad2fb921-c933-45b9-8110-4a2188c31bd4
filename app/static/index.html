@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CDC 复制槽回收值班台</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #171e2e; --panel2: #1d2638; --line: #2a3550;
+    --fg: #dbe4f5; --dim: #8fa0bf; --ok: #34d399; --warn: #fbbf24;
+    --bad: #f87171; --info: #60a5fa; --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.55 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  header { padding: 18px 24px 10px; border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0; font-size: 20px; }
+  header .sub { color: var(--dim); margin-top: 4px; font-size: 13px; }
+  main { padding: 16px 24px 40px; max-width: 1180px; }
+  .banner { display: none; padding: 10px 14px; border-radius: 8px; margin-bottom: 14px;
+            background: #3b1d1d; border: 1px solid var(--bad); color: #fecaca; }
+  .banner.show { display: block; }
+  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 900px) { .cards { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .card h2 { margin: 0 0 10px; font-size: 15px; color: var(--dim); font-weight: 600; }
+  table.kv { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.kv td { padding: 3px 0; vertical-align: top; }
+  table.kv td:first-child { color: var(--dim); width: 42%; }
+  table.kv td:last-child { font-family: var(--mono); font-size: 12.5px; word-break: break-all; }
+  .badge { display: inline-block; padding: 1px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .b-ok   { background: #06382b; color: var(--ok);   border: 1px solid #0e5c44; }
+  .b-bad  { background: #3b1d1d; color: var(--bad);  border: 1px solid #7f2d2d; }
+  .b-warn { background: #3a2f10; color: var(--warn); border: 1px solid #6b5518; }
+  .b-dim  { background: #232c42; color: var(--dim);  border: 1px solid var(--line); }
+  .b-info { background: #12283f; color: var(--info); border: 1px solid #1d4e7e; }
+  .leasebar { height: 8px; background: #232c42; border-radius: 4px; overflow: hidden; margin-top: 6px; }
+  .leasebar > div { height: 100%; background: var(--ok); transition: width .12s linear; }
+  .leasebar.expired > div { background: var(--bad); }
+  .actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 16px 0; align-items: center; }
+  button { background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+           border-radius: 8px; padding: 8px 14px; font-size: 13.5px; cursor: pointer; }
+  button:hover { border-color: var(--info); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: #12395e; border-color: #1d4e7e; }
+  button.danger  { background: #40201f; border-color: #7f2d2d; }
+  .tools { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+           padding: 12px 16px; margin-bottom: 16px; font-size: 13px; color: var(--dim); }
+  .tools input[type=number] { width: 90px; background: var(--bg); color: var(--fg);
+           border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; font-family: var(--mono); }
+  .tools b { color: var(--fg); font-family: var(--mono); }
+  #log { background: #0b0f18; border: 1px solid var(--line); border-radius: 10px;
+         padding: 10px 12px; height: 300px; overflow: auto; font-family: var(--mono); font-size: 12px; }
+  #log .line { border-bottom: 1px solid #161d2c; padding: 4px 0; white-space: pre-wrap; word-break: break-all; }
+  #log .t { color: var(--dim); }
+  #log .ok { color: var(--ok); } #log .err { color: var(--bad); } #log .info { color: var(--info); }
+  .muted { color: var(--dim); font-size: 12px; }
+  h2.sec { font-size: 14px; color: var(--dim); margin: 18px 0 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CDC 复制槽回收值班台</h1>
+  <div class="sub">PostgreSQL 16 逻辑复制槽 · 失联消费者回收 · 5 秒租约 + 代次 fencing · 状态以数据库实况为准</div>
+</header>
+<main>
+  <div id="banner" class="banner"></div>
+
+  <div class="cards">
+    <div class="card">
+      <h2>复制槽（pg_replication_slots 实况）</h2>
+      <table class="kv"><tbody id="slotBody"></tbody></table>
+    </div>
+    <div class="card">
+      <h2>消费者租约（5 秒心跳）</h2>
+      <table class="kv"><tbody id="leaseBody"></tbody></table>
+      <div class="leasebar" id="leaseBar"><div id="leaseFill" style="width:0%"></div></div>
+      <div class="muted" id="leaseHint"></div>
+    </div>
+  </div>
+
+  <div class="actions">
+    <button id="btnCreate" class="primary">① 创建演示槽</button>
+    <button id="btnWrite">② 模拟写入 ×100</button>
+    <button id="btnRenew">③ 续租（当前代）</button>
+    <button id="btnReclaim" class="danger">④ 确认回收</button>
+    <button id="btnRefresh">刷新</button>
+    <label class="muted"><input type="checkbox" id="auto" checked> 自动刷新 1s</label>
+  </div>
+
+  <div class="tools">
+    fencing 交错测试：当前代 <b id="curGen">—</b>，
+    用指定代续租 → <input type="number" id="genInput" min="1" placeholder="代次">
+    <button id="btnRenewGen">发送旧代续租</button>
+    <span class="muted">（回收成功后或同名重建后，旧代续租应被拒绝；回收/重建前请先在 5 秒内操作以观察“续租先成功则不得删除”）</span>
+  </div>
+
+  <h2 class="sec">操作日志</h2>
+  <div id="log"></div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let lastStatus = null, leaseFetchedAt = 0, leaseRemaining = null;
+
+function esc(s) { return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function fmtBytes(n) {
+  if (n === null || n === undefined) return '—';
+  const u = ['B','KiB','MiB','GiB','TiB']; let i = 0, v = Number(n);
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${u[i]} (${n} B)`;
+}
+function badge(text, cls) { return `<span class="badge ${cls}">${esc(text)}</span>`; }
+function row(k, v) { return `<tr><td>${esc(k)}</td><td>${v}</td></tr>`; }
+
+function log(kind, msg, obj) {
+  const el = document.createElement('div');
+  el.className = 'line';
+  const t = new Date().toLocaleTimeString('zh-CN', {hour12: false});
+  let extra = '';
+  if (obj !== undefined) {
+    let s = JSON.stringify(obj, (k, v) => k === 'status' ? '[略]' : v);
+    if (s.length > 600) s = s.slice(0, 600) + '…';
+    extra = '\n  ' + s;
+  }
+  el.innerHTML = `<span class="t">${t}</span> <span class="${kind}">${esc(msg)}</span>${esc(extra)}`;
+  const box = $('log');
+  box.prepend(el);
+  while (box.children.length > 80) box.lastChild.remove();
+}
+
+async function api(path, method = 'GET', body) {
+  const opt = { method, headers: {} };
+  if (body !== undefined) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+  const r = await fetch(path, opt);
+  let j = null;
+  try { j = await r.json(); } catch (e) { /* 非 JSON */ }
+  return { code: r.status, body: j };
+}
+
+function render(st) {
+  lastStatus = st;
+  const banner = $('banner');
+  if (!st.db_ok) {
+    banner.textContent = '⚠ 数据库不可达：' + (st.error || '未知错误') + '（以下为最后一次实况，不做任何推断）';
+    banner.classList.add('show');
+    $('slotBody').innerHTML = row('数据库', badge('不可达', 'b-bad'));
+    $('leaseBody').innerHTML = row('租约', badge('未知', 'b-dim'));
+    leaseRemaining = null;
+    return;
+  }
+  banner.classList.remove('show');
+
+  // ---- slot ----
+  const s = st.slot || { exists: false };
+  let h = '';
+  h += row('槽名', `<b>${esc(st.slot_name)}</b>`);
+  h += row('是否存在', s.exists ? badge('存在', 'b-info') : badge('不存在', 'b-dim'));
+  if (s.exists) {
+    h += row('数据库是否正在使用', s.active ? badge(`使用中 (active_pid=${s.active_pid})`, 'b-warn') : badge('空闲', 'b-ok'));
+    h += row('插件 / 类型', `${esc(s.plugin)} / ${esc(s.slot_type)}（库 ${esc(s.database)}）`);
+    h += row('实际保留 WAL', `<b>${esc(fmtBytes(s.retained_bytes))}</b>`);
+    h += row('未确认 WAL', esc(fmtBytes(s.unconfirmed_bytes)));
+    h += row('restart_lsn', esc(s.restart_lsn));
+    h += row('confirmed_flush_lsn', esc(s.confirmed_flush_lsn));
+    h += row('当前 WAL 位置', esc(s.current_wal_lsn));
+    h += row('wal_status', esc(s.wal_status));
+    h += row('catalog_xmin', esc(s.catalog_xmin));
+  }
+  $('slotBody').innerHTML = h;
+
+  // ---- lease ----
+  const l = st.lease;
+  h = '';
+  if (!l) {
+    h += row('租约', badge('无记录', 'b-dim'));
+    $('curGen').textContent = '—';
+    leaseRemaining = null;
+    $('leaseHint').textContent = '';
+  } else {
+    const stBadge = l.state === 'active'
+      ? (l.expired ? badge('已过期', 'b-bad') : badge('有效', 'b-ok'))
+      : badge('已回收(reclaimed)', 'b-dim');
+    h += row('状态', stBadge);
+    h += row('代次 (fencing)', `<b>${l.generation}</b>`);
+    h += row('到期时间', esc(l.expires_at));
+    h += row('剩余', `<span id="remainTxt">${l.state === 'active' ? (l.remaining_ms / 1000).toFixed(1) + ' s' : '—'}</span>`);
+    $('curGen').textContent = l.generation;
+    leaseRemaining = l.state === 'active' ? l.remaining_ms : null;
+    leaseFetchedAt = Date.now();
+    $('leaseHint').textContent = l.state === 'active'
+      ? (l.expired ? '租约已过期：允许回收（还需数据库确认槽未被使用）' : '租约有效：回收将被拒绝')
+      : '租约已回收：旧代续租将被拒绝；同名重建会签发新一代';
+  }
+  $('leaseBody').innerHTML = h;
+}
+
+function tick() {
+  if (leaseRemaining === null) return;
+  const leaseMs = (lastStatus && lastStatus.lease_seconds ? lastStatus.lease_seconds : 5) * 1000;
+  const left = leaseRemaining - (Date.now() - leaseFetchedAt);
+  const pct = Math.max(0, Math.min(100, left / leaseMs * 100));
+  $('leaseFill').style.width = pct + '%';
+  $('leaseBar').classList.toggle('expired', left <= 0);
+  const t = $('remainTxt');
+  if (t) t.textContent = left > 0 ? (left / 1000).toFixed(1) + ' s' : '已过期 ' + (-left / 1000).toFixed(1) + ' s';
+}
+
+async function refresh() {
+  try {
+    const r = await api('/api/status');
+    if (r.body) render(r.body);
+  } catch (e) {
+    $('banner').textContent = '⚠ 无法连接服务：' + e;
+    $('banner').classList.add('show');
+  }
+}
+
+async function act(label, path, body) {
+  log('info', `→ ${label}`);
+  try {
+    const r = await api(path, 'POST', body);
+    const j = r.body || {};
+    if (r.code < 300 && j.ok) log('ok', `✔ ${label} 成功`, j);
+    else log('err', `✘ ${label} 失败 [${r.code}] ${j.detail || j.error || ''}`, j);
+  } catch (e) {
+    log('err', `✘ ${label} 请求异常: ${e}`);
+  }
+  refresh();
+}
+
+$('btnCreate').onclick = () => act('创建演示槽', '/api/slot/create');
+$('btnWrite').onclick  = () => act('模拟写入 ×100', '/api/demo/write', { rows: 100 });
+$('btnRenew').onclick  = () => {
+  const g = lastStatus && lastStatus.lease ? lastStatus.lease.generation : null;
+  if (!g) { log('err', '✘ 当前没有租约，无法续租'); return; }
+  act(`续租（代 ${g}）`, '/api/slot/renew', { generation: g });
+};
+$('btnRenewGen').onclick = () => {
+  const g = parseInt($('genInput').value, 10);
+  if (!g) { log('err', '✘ 请输入代次'); return; }
+  act(`续租（指定代 ${g}）`, '/api/slot/renew', { generation: g });
+};
+$('btnReclaim').onclick = () => {
+  if (!confirm('确认回收？\n仅当租约已过期且数据库确认槽未被使用时才会真正删除。')) return;
+  act('确认回收', '/api/slot/reclaim');
+};
+$('btnRefresh').onclick = refresh;
+
+setInterval(() => { if ($('auto').checked) refresh(); }, 1000);
+setInterval(tick, 100);
+refresh();
+</script>
+</body>
+</html>
