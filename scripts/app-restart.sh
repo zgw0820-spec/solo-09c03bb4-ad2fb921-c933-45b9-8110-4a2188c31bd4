@@ -3,6 +3,7 @@
 set -euo pipefail
 RT="${CDC_RUNTIME:-$HOME/cdc-runtime}"
 APP_DIR="$(cd "$(dirname "$0")/../app" && pwd)"
+mkdir -p "$RT"
 
 pkill -f 'uvicorn main:app' 2>/dev/null || true
 sleep 1

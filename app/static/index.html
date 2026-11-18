@@ -221,8 +221,15 @@ async function act(label, path, body) {
   try {
     const r = await api(path, 'POST', body);
     const j = r.body || {};
-    if (r.code < 300 && j.ok) log('ok', `✔ ${label} 成功`, j);
-    else log('err', `✘ ${label} 失败 [${r.code}] ${j.detail || j.error || ''}`, j);
+    if (r.code < 300 && j.ok) {
+      // 回收成功时突出"实际被回收的代次", 便于核对没有谎报新代
+      const genNote = (path === '/api/slot/reclaim' && j.generation !== undefined)
+        ? `（实际回收代次 ${j.generation}）` : '';
+      log('ok', `✔ ${label} 成功${genNote}`, j);
+    } else {
+      log('err', `✘ ${label} 失败 [${r.code}] ${j.detail || j.error || ''}`
+        + (j.generation !== undefined ? `（代次 ${j.generation}）` : ''), j);
+    }
   } catch (e) {
     log('err', `✘ ${label} 请求异常: ${e}`);
   }

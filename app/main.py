@@ -5,15 +5,23 @@
 安全不变量(全部以数据库实况为准, 服务本身无内存状态):
 1. 租约持久化在 cdc_slot_lease 表, generation 列是 fencing token(代次)。
 2. 续租 = 单条原子 UPDATE, 仅当 (slot_name, generation, state='active') 全部匹配才生效。
-3. 回收 = 先在事务内 SELECT ... FOR UPDATE 并原子 tombstone(state -> 'reclaimed'),
-   再依据 pg_replication_slots 实况决定能否 pg_drop_replication_slot:
+3. 回收 = 单个事务内完成全部动作: SELECT ... FOR UPDATE 锁定租约行 -> 资格判定
+   -> tombstone(state -> 'reclaimed') -> 查 pg_replication_slots 实况
+   -> pg_drop_replication_slot -> 删后复核, 全部成功才 COMMIT:
    - 租约仍在有效期内 -> 拒绝(续租先成功则不得删除);
    - tombstone 先提交 -> 之后的旧续租必然失败(回收先成功则旧续租失败);
-   - 数据库显示槽 active -> 回滚 tombstone, 不删除;
-   - 删除失败 -> 回滚 tombstone 并如实上报, 绝不谎报已回收。
+   - 数据库显示槽 active -> 整个事务回滚, tombstone 不落库, 不删除;
+   - 删除失败 -> 整个事务回滚并如实上报, 绝不谎报已回收, 之后可按实况安全重试。
 4. 同名重建会使 generation +1, 旧代续租无法影响新槽。
-5. 崩溃恢复: tombstone 已提交但槽未删(服务重启/崩溃)时, 再次回收会沿着
-   已有的 'reclaimed' tombstone 继续完成删除, 状态始终来自数据库实况。
+   重建的租约 upsert 与回收争抢同一租约行锁: 回收事务持锁期间重建只能等待,
+   待回收提交后重建才以新一代生效, 因此迟到的旧回收既看不到也碰不到新槽/新租约;
+   若重建先拿到锁并提交(新一代 active 租约), 旧回收恢复后按新代实况重新判定:
+   新代未过期 -> 拒绝; 已过期 -> 只回收新代自己, 响应中如实标注被回收的代次。
+5. 回收的删除动作严格绑定"取得回收资格时锁定的那一代": 事务内删除前后各做一次
+   实况复核, 只要槽已不存在或租约代次/状态在锁内发生变化, 就不执行删除并按实况上报,
+   绝不可能把同名重建产生的新槽当成旧槽删掉, 也不会谎报回收了新代。
+6. 崩溃恢复: tombstone 已提交但槽未删(服务重启/崩溃)时, 再次回收会沿着
+   已有的 'reclaimed' tombstone 在同一单事务内继续完成删除, 状态始终来自数据库实况。
 """
 from __future__ import annotations
 
@@ -78,7 +86,7 @@ RETURNING generation, expires_at,
           (extract(epoch FROM (expires_at - clock_timestamp())) * 1000)::bigint AS remaining_ms
 """
 
-# 回收第 1 步: 事务内行锁 + 原子 tombstone(租约过期 或 崩溃遗留 tombstone 才允许)。
+# 回收: 单事务内行锁 + 资格判定 + 带代次守卫的原子 tombstone。
 TOMBSTONE_LOCK_SQL = """
 SELECT generation, state, expires_at,
        (expires_at <= clock_timestamp()) AS expired,
@@ -88,17 +96,22 @@ WHERE slot_name = %(n)s
 FOR UPDATE
 """
 
+# tombstone 必须携带代次守卫: 只允许标记我们在锁内判定合格的那一代,
+# 代次不符(例如锁等待期间被同名重建换成新一代)时一行都不改。
 TOMBSTONE_SQL = """
 UPDATE cdc_slot_lease
 SET state = 'reclaimed', updated_at = clock_timestamp()
-WHERE slot_name = %(n)s
+WHERE slot_name = %(n)s AND generation = %(g)s AND state = %(from_state)s
+RETURNING generation, state
 """
 
-# 回收失败回滚: 仅当我们本次把 active 改成了 reclaimed 才回滚, 且必须同代。
-REVERT_SQL = """
-UPDATE cdc_slot_lease
-SET state = 'active', expires_at = %(old_expires)s, updated_at = clock_timestamp()
-WHERE slot_name = %(n)s AND generation = %(g)s AND state = 'reclaimed'
+# 删槽前后的事务内复核: 确认租约仍是我们锁定的那一代且已 tombstone,
+# 任何代次/状态漂移都说明出现了重建交错, 必须立即停止删除。
+LEASE_GUARD_SQL = """
+SELECT generation, state
+FROM cdc_slot_lease
+WHERE slot_name = %(n)s
+FOR UPDATE
 """
 
 # 创建: 同名重建时 generation 单调 +1, 旧代 fencing token 立即失效。
@@ -152,6 +165,14 @@ def fetch_slot() -> dict | None:
     """直接读 pg_replication_slots 实况(独立 autocommit 连接)。"""
     with db_connect(autocommit=True) as conn:
         return conn.execute(SLOT_SQL, {"n": SLOT_NAME}).fetchone()
+
+
+def fetch_slot_safe() -> dict | None:
+    """同 fetch_slot, 但数据库异常时返回 None(供自愈前检使用, 不掩盖主流程异常)。"""
+    try:
+        return fetch_slot()
+    except Exception:
+        return None
 
 
 def slot_view(slot: dict | None) -> dict:
@@ -259,7 +280,13 @@ def api_status():
 
 @app.post("/api/slot/create")
 def api_create():
-    """创建演示槽并签发新一代租约。已存在则拒绝(不重复创建)。"""
+    """创建演示槽并签发新一代租约。已存在则拒绝(不重复创建)。
+
+    顺序: 先 upsert 租约(在租约行上排队/拿锁, 同名重建 generation+1),
+    再创建物理槽。这样与回收的争用全部收敛到 cdc_slot_lease 的同一把行锁:
+    回收事务持锁期间本请求的 upsert 阻塞等待, 回收提交后才以新一代生效,
+    新槽必然属于新代租约, 迟到的旧回收无法把它当作旧槽删除。
+    """
     try:
         if fetch_slot():
             return jresp(
@@ -270,7 +297,42 @@ def api_create():
     except Exception as exc:
         return db_unavailable(exc)
 
-    # 1) 建槽(autocommit: 逻辑槽创建不允许在已有写入的事务里)
+    # 自愈前检: 槽不存在但存在 active 租约, 说明上一次创建在"租约已提交、
+    # 物理槽未建成"之间中断(进程崩溃)。此时不重新晋升代次, 直接复用该租约补建槽,
+    # 避免留下"有 active 租约却无槽"的脑裂, 也不浪费 fencing 代次。
+    try:
+        with db_connect(autocommit=True) as c0:
+            stale_lease = c0.execute(LEASE_SQL, {"n": SLOT_NAME}).fetchone()
+    except Exception as exc:
+        return db_unavailable(exc)
+    resume_generation = None
+    if (stale_lease and stale_lease["state"] == "active"
+            and not stale_lease["expired"] and not fetch_slot_safe()):
+        resume_generation = stale_lease["generation"]
+        steps_note = f"检测到崩溃遗留的无槽 active 租约(代 {resume_generation}), 复用补建槽"
+    else:
+        steps_note = None
+
+    if resume_generation is None:
+        # 1) 签发/晋升租约(同名重建 -> generation +1)。
+        #    若回收事务正持有该行锁, 这里阻塞到回收提交后再执行, 不会与旧回收交错。
+        try:
+            with db_connect() as conn:
+                lease = conn.execute(
+                    LEASE_UPSERT_SQL, {"n": SLOT_NAME, "secs": LEASE_SECONDS}
+                ).fetchone()
+                conn.commit()
+        except Exception as exc:
+            return jresp(
+                {"ok": False, "error": "lease_failed",
+                 "detail": f"{type(exc).__name__}: {exc}", "status": build_status()},
+                status_code=500,
+            )
+        new_generation = lease["generation"]
+    else:
+        new_generation = resume_generation
+
+    # 2) 建槽(autocommit: 逻辑槽创建不允许在已有写入的事务里)
     try:
         with db_connect(autocommit=True) as conn:
             row = conn.execute(
@@ -289,41 +351,35 @@ def api_create():
                 )
         except Exception as exc2:
             return db_unavailable(exc2)
+        # 槽没建成: 不主动回退代次(代次单调递增是 fencing 的前提), 如实上报;
+        # 再次调用本接口会走自愈前检复用该 active 租约重试建槽, 不会留下无租约的槽。
         return jresp(
             {"ok": False, "error": "create_failed",
-             "detail": f"{type(exc).__name__}: {exc}", "status": build_status()},
+             "detail": f"{type(exc).__name__}: {exc}",
+             "generation": new_generation, "status": build_status()},
             status_code=500,
         )
 
-    # 2) 签发租约(同名重建 -> generation +1)
+    # 成功响应: 租约到期时间取数据库实况(resume 分支没有本次 upsert 的返回值)
     try:
-        with db_connect() as conn:
-            lease = conn.execute(
-                LEASE_UPSERT_SQL, {"n": SLOT_NAME, "secs": LEASE_SECONDS}
-            ).fetchone()
-    except Exception as exc:
-        # 租约写库失败: 尽力把刚建的槽删掉, 不留无租约的槽
-        try:
-            with db_connect(autocommit=True) as conn:
-                conn.execute("SELECT pg_drop_replication_slot(%(n)s)", {"n": SLOT_NAME})
-        except Exception:
-            pass
-        return jresp(
-            {"ok": False, "error": "lease_failed",
-             "detail": f"{type(exc).__name__}: {exc}", "status": build_status()},
-            status_code=500,
-        )
+        final_lease = db_connect(autocommit=True)
+        with final_lease as c:
+            lease_now = c.execute(LEASE_SQL, {"n": SLOT_NAME}).fetchone()
+        expires_iso = lease_now["expires_at"].isoformat() if lease_now else None
+    except Exception:
+        expires_iso = None
 
-    return jresp(
-        {
-            "ok": True,
-            "created": True,
-            "slot_lsn": row["lsn"],
-            "generation": lease["generation"],
-            "expires_at": lease["expires_at"].isoformat(),
-            "status": build_status(),
-        }
-    )
+    payload = {
+        "ok": True,
+        "created": True,
+        "slot_lsn": row["lsn"],
+        "generation": new_generation,
+        "expires_at": expires_iso,
+        "status": build_status(),
+    }
+    if steps_note:
+        payload["recovered"] = steps_note
+    return jresp(payload)
 
 
 class RenewIn(BaseModel):
@@ -368,14 +424,21 @@ def api_renew(body: RenewIn):
 
 @app.post("/api/slot/reclaim")
 def api_reclaim():
-    """确认回收: 租约过期 且 数据库确认槽未被使用 才真正删除。"""
+    """确认回收: 租约过期 且 数据库确认槽未被使用 才真正删除。
+
+    全部动作在单个数据库事务内完成, 租约行锁贯穿始终:
+    回收资格、tombstone、删槽、复核绑定同一个 generation(fencing token),
+    同名重建的租约 upsert 被行锁挡在事务外, 迟到的旧回收不可能误删新槽。
+    """
     steps: list[dict] = []
 
-    # -- 第 1 步: 事务内原子 tombstone(与续租的交错在此分出先后) -------------
     try:
+        # 单事务: 出错/拒绝一律 rollback, 全部成功才 commit。
         with db_connect() as conn:
+            # -- 1. 行锁 + 回收资格判定(与续租/重建的交错在此分出先后) ----------
             row = conn.execute(TOMBSTONE_LOCK_SQL, {"n": SLOT_NAME}).fetchone()
             if row is None:
+                conn.rollback()
                 return jresp(
                     {"ok": False, "reclaimed": False, "error": "no_lease",
                      "detail": "租约记录不存在", "steps": steps,
@@ -383,106 +446,145 @@ def api_reclaim():
                     status_code=409,
                 )
             old = dict(row)
+            target_generation = old["generation"]
             allowed = old["state"] == "reclaimed" or (
                 old["state"] == "active" and old["expired"]
             )
             if not allowed:
+                # 锁内实况: 新代 active 且未过期(可能是同名重建后的新租约) -> 拒绝,
+                # 不写 tombstone、不删槽、不改新租约。
+                conn.rollback()
                 return jresp(
                     {"ok": False, "reclaimed": False, "error": "lease_active",
-                     "detail": f"租约仍在有效期内(剩余约 {old['remaining_ms']} ms), 不得删除",
+                     "detail": f"代次 {target_generation} 租约仍在有效期内"
+                               f"(剩余约 {old['remaining_ms']} ms), 不得删除",
+                     "generation": target_generation, "steps": steps,
+                     "status": build_status()},
+                    status_code=409,
+                )
+
+            # -- 2. 带代次守卫的 tombstone(只标记资格判定对应的那一代) ----------
+            updated = conn.execute(
+                TOMBSTONE_SQL,
+                {"n": SLOT_NAME, "g": target_generation,
+                 "from_state": old["state"]},
+            ).fetchone()
+            if updated is None or updated["generation"] != target_generation:
+                # 理论上被同一行锁保护不会发生; 一旦发生说明实况与判定不一致,
+                # 绝不继续删除, 整体回滚并如实上报。
+                conn.rollback()
+                return jresp(
+                    {"ok": False, "reclaimed": False, "error": "lease_changed",
+                     "detail": "tombstone 时代次守卫未命中, 租约实况已变化, 已放弃回收",
                      "steps": steps, "status": build_status()},
                     status_code=409,
                 )
-            conn.execute(TOMBSTONE_SQL, {"n": SLOT_NAME})
-        steps.append({"step": "tombstone_lease", "ok": True,
-                      "detail": f"租约代次 {old['generation']} 已标记 reclaimed(原状态 {old['state']})"})
-    except Exception as exc:
-        return db_unavailable(exc)
+            steps.append({
+                "step": "tombstone_lease", "ok": True,
+                "detail": f"租约代次 {target_generation} 已标记 reclaimed"
+                          f"(原状态 {old['state']}), 回收已绑定该代次"})
 
-    transitioned = old["state"] == "active"  # 本次是否把 active 改成了 reclaimed
-
-    def revert_tombstone() -> None:
-        if not transitioned:
-            return
-        try:
-            with db_connect() as conn:
-                conn.execute(
-                    REVERT_SQL,
-                    {"n": SLOT_NAME, "g": old["generation"],
-                     "old_expires": old["expires_at"]},
-                )
-            steps.append({"step": "revert_tombstone", "ok": True,
-                          "detail": "已按原样回滚租约标记"})
-        except Exception as exc:  # 回滚失败也要如实记录
-            steps.append({"step": "revert_tombstone", "ok": False,
-                          "detail": f"{type(exc).__name__}: {exc}"})
-
-    # -- 第 2 步: 数据库实况: 槽是否存在 / 是否正在使用 ------------------------
-    try:
-        slot = fetch_slot()
-    except Exception as exc:
-        revert_tombstone()
-        return db_unavailable(exc)
-
-    if slot and slot["active"]:
-        revert_tombstone()
-        steps.append({"step": "check_active", "ok": False,
-                      "detail": f"数据库正在使用该槽(active_pid={slot['active_pid']}), 不得删除"})
-        return jresp(
-            {"ok": False, "reclaimed": False, "error": "slot_active",
-             "detail": "数据库正在使用该复制槽, 已取消回收", "steps": steps,
-             "status": build_status()},
-            status_code=409,
-        )
-    steps.append({"step": "check_active", "ok": True,
-                  "detail": "数据库确认槽未被使用" if slot else "数据库中已不存在该槽"})
-
-    # -- 第 3 步: 真正删除 -----------------------------------------------------
-    if slot:
-        try:
-            with db_connect(autocommit=True) as conn:
-                conn.execute("SELECT pg_drop_replication_slot(%(n)s)", {"n": SLOT_NAME})
-            steps.append({"step": "drop_slot", "ok": True,
-                          "detail": "pg_drop_replication_slot 已执行"})
-        except Exception as exc:
-            # 删除报错后先核实实况: 可能并发回收已完成
-            try:
-                still = fetch_slot()
-            except Exception as exc2:
-                revert_tombstone()
-                return db_unavailable(exc2)
-            if still is None:
-                steps.append({"step": "drop_slot", "ok": True,
-                              "detail": f"删除报错但复核确认槽已不存在(可能并发回收完成): {exc}"})
-            else:
-                revert_tombstone()
-                steps.append({"step": "drop_slot", "ok": False,
-                              "detail": f"{type(exc).__name__}: {exc}"})
+            # -- 3. 数据库实况: 槽是否存在 / 是否正在使用(同一事务内) ------------
+            slot = conn.execute(SLOT_SQL, {"n": SLOT_NAME}).fetchone()
+            if slot and slot["active"]:
+                conn.rollback()
+                steps.append({"step": "check_active", "ok": False,
+                              "detail": f"数据库正在使用该槽(active_pid={slot['active_pid']}), 不得删除"})
                 return jresp(
-                    {"ok": False, "reclaimed": False, "error": "drop_failed",
-                     "detail": f"删除复制槽失败: {exc}", "steps": steps,
+                    {"ok": False, "reclaimed": False, "error": "slot_active",
+                     "detail": "数据库正在使用该复制槽, 已取消回收(tombstone 一并回滚)",
+                     "generation": target_generation, "steps": steps,
+                     "status": build_status()},
+                    status_code=409,
+                )
+            steps.append({"step": "check_active", "ok": True,
+                          "detail": "数据库确认槽未被使用" if slot else "数据库中已不存在该槽"})
+
+            # -- 4. 删槽前最后一道代次守卫 --------------------------------------
+            # 持锁期间 generation 不可能被重建改写; 守卫把"只删资格对应旧槽"的
+            # 约束显式落库, 任何意外漂移都在这里挡住删除。
+            guard = conn.execute(LEASE_GUARD_SQL, {"n": SLOT_NAME}).fetchone()
+            if (guard is None or guard["generation"] != target_generation
+                    or guard["state"] != "reclaimed"):
+                conn.rollback()
+                steps.append({"step": "generation_guard", "ok": False,
+                              "detail": f"删槽前租约实况已漂移: {guard}, 期望代次 {target_generation}/reclaimed"})
+                return jresp(
+                    {"ok": False, "reclaimed": False, "error": "generation_changed",
+                     "detail": "检测到同名重建交错(租约代次/状态已变化), 旧回收拒绝删除新槽",
+                     "steps": steps, "status": build_status()},
+                    status_code=409,
+                )
+
+            # -- 5. 真正删除(仅当槽在事务实况中存在) -----------------------------
+            if slot:
+                try:
+                    conn.execute(
+                        "SELECT pg_drop_replication_slot(%(n)s)", {"n": SLOT_NAME}
+                    )
+                except Exception as exc:
+                    # 事务内删除失败: 整个事务回滚(tombstone 不落库), 如实上报,
+                    # 数据库实况不变, 之后可安全重试。
+                    conn.rollback()
+                    # 用独立连接复核实况(回滚后原事务已结束)
+                    try:
+                        still = fetch_slot()
+                    except Exception as exc2:
+                        return db_unavailable(exc2)
+                    steps.append({"step": "drop_slot", "ok": False,
+                                  "detail": f"{type(exc).__name__}: {exc}"})
+                    if still is None:
+                        # 极端情况: 报错但槽实际已不在(并发回收已完成), 按实况上报
+                        steps.append({"step": "drop_slot", "ok": True,
+                                      "detail": f"删除报错但复核确认槽已不存在(可能并发回收完成): {exc}"})
+                        return jresp(
+                            {"ok": True, "reclaimed": True,
+                             "generation": target_generation, "steps": steps,
+                             "status": build_status()}
+                        )
+                    return jresp(
+                        {"ok": False, "reclaimed": False, "error": "drop_failed",
+                         "detail": f"删除复制槽失败: {exc}",
+                         "generation": target_generation, "steps": steps,
+                         "status": build_status()},
+                        status_code=500,
+                    )
+                steps.append({"step": "drop_slot", "ok": True,
+                              "detail": f"pg_drop_replication_slot 已执行(仅针对代次 {target_generation} 对应的槽)"})
+
+            # -- 6. 删后复核 + 代次复核, 全部通过才提交 ---------------------------
+            final = conn.execute(SLOT_SQL, {"n": SLOT_NAME}).fetchone()
+            guard2 = conn.execute(LEASE_GUARD_SQL, {"n": SLOT_NAME}).fetchone()
+            if final is not None:
+                conn.rollback()
+                steps.append({"step": "verify", "ok": False, "detail": "删除后槽仍存在"})
+                return jresp(
+                    {"ok": False, "reclaimed": False, "error": "verify_failed",
+                     "detail": "删除后复核发现槽仍存在, 事务已回滚", "steps": steps,
                      "status": build_status()},
                     status_code=500,
                 )
-
-    # -- 第 4 步: 删除后复核, 按实况上报 ---------------------------------------
-    try:
-        final = fetch_slot()
+            if guard2 is None or guard2["generation"] != target_generation \
+                    or guard2["state"] != "reclaimed":
+                conn.rollback()
+                steps.append({"step": "generation_guard", "ok": False,
+                              "detail": f"提交前租约代次漂移: {guard2}"})
+                return jresp(
+                    {"ok": False, "reclaimed": False, "error": "generation_changed",
+                     "detail": "提交前检测到代次漂移, 已回滚, 未声称回收新代",
+                     "steps": steps, "status": build_status()},
+                    status_code=409,
+                )
+            steps.append({"step": "verify", "ok": True,
+                          "detail": f"复核确认槽已不存在, 被回收的是代次 {target_generation}"})
+            conn.commit()
     except Exception as exc:
+        # 连接/事务级异常: with 退出时自动 rollback, 数据库保持回收前实况
         return db_unavailable(exc)
-    if final is not None:
-        revert_tombstone()
-        steps.append({"step": "verify", "ok": False, "detail": "删除后槽仍存在"})
-        return jresp(
-            {"ok": False, "reclaimed": False, "error": "verify_failed",
-             "detail": "删除后复核发现槽仍存在, 已回滚租约标记", "steps": steps,
-             "status": build_status()},
-            status_code=500,
-        )
-    steps.append({"step": "verify", "ok": True, "detail": "复核确认槽已不存在"})
 
     return jresp(
-        {"ok": True, "reclaimed": True, "steps": steps, "status": build_status()}
+        {"ok": True, "reclaimed": True, "generation": target_generation,
+         "steps": steps, "status": build_status()}
     )
 
 

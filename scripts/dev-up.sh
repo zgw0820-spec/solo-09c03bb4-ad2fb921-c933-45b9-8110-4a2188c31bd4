@@ -8,6 +8,7 @@ PGBIN="$RT/pg16/bin"
 PGDATA="$RT/pgdata"
 PGPORT="${PGPORT:-5432}"
 APP_DIR="$(cd "$(dirname "$0")/../app" && pwd)"
+mkdir -p "$RT"
 
 if [[ "${1:-}" == "--reset" ]]; then
   "$PGBIN/pg_ctl" -D "$PGDATA" -m immediate stop >/dev/null 2>&1 || true
